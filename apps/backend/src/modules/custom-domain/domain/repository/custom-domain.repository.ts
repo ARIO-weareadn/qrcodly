@@ -1,6 +1,5 @@
 import { singleton } from 'tsyringe';
-import { and, count, desc, eq, gte, inArray } from 'drizzle-orm';
-import { SSL_STATUS_GROUPS } from '@shared/schemas';
+import { and, count, desc, eq } from 'drizzle-orm';
 import AbstractRepository from '@/core/domain/repository/abstract.repository';
 import { type ISqlQueryFindBy } from '@/core/interface/repository.interface';
 import customDomain, { TCustomDomain } from '../entities/custom-domain.entity';
@@ -258,26 +257,6 @@ class CustomDomainRepository extends AbstractRepository<TCustomDomain> {
 			.from(this.table)
 			.execute();
 		return rows.map((row) => row.userId);
-	}
-
-	/**
-	 * Enabled domains created since `createdAfter` that are still waiting on DNS or their certificate.
-	 *
-	 * Drives the periodic verification sweep, so a domain goes live without the user having to
-	 * come back and check its status by hand.
-	 */
-	async findPendingVerification(createdAfter: Date): Promise<TCustomDomain[]> {
-		return this.db
-			.select()
-			.from(this.table)
-			.where(
-				and(
-					eq(this.table.isEnabled, true),
-					inArray(this.table.sslStatus, [...SSL_STATUS_GROUPS.pending]),
-					gte(this.table.createdAt, createdAfter),
-				),
-			)
-			.execute();
 	}
 
 	async findAllByUserId(userId: string): Promise<TCustomDomain[]> {

@@ -1,0 +1,236 @@
+# Stack de producción de QRcodly para qr.weareadn.dev, detrás de Plesk.
+# .env.production no se versiona: cópialo desde .env.production.example
+# y rellena los secretos. .gitignore ignora .env.production a propósito;
+# la plantilla .env.production.example sí se versiona.
+#
+# Despliegue en dos pasos. `next build` descarga el OpenAPI del API, así que
+# no construyas frontend y backend en el mismo `up`:
+#   1. docker compose -f docker-compose.prod.yaml up -d --build backend
+#      Arranca db, redis, minio, minio-setup y migrate, y deja el API
+#      en 127.0.0.1:5001.
+#   2. docker compose -f docker-compose.prod.yaml up -d --build frontend
+#      El build usa la red del host y
+#      OPENAPI_URL=http://127.0.0.1:5001/api/v1/openapi.json.
+#
+# Plesk hace de proxy: / → frontend, /api/v1/ → backend,
+# /storage/qrcodly/ → API de MinIO. MySQL, Redis y la consola :9001 no se publican.
+
+name: qrcodly-prod
+
+services:
+  db:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Define MYSQL_ROOT_PASSWORD en .env.production. Genera uno con openssl rand -hex 32}
+      MYSQL_DATABASE: qrcodly
+      MYSQL_USER: ${DB_USER:-qrcodly}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?Define DB_PASSWORD en .env.production. Genera uno con openssl rand -hex 32}
+    command:
+      - --max-connections=200
+      - --innodb-buffer-pool-size=512M
+      - --innodb-redo-log-capacity=256M
+      - --innodb-flush-log-at-trx-commit=2
+      - --innodb-flush-method=O_DIRECT
+    volumes:
+      - qrcodly_db:/var/lib/mysql
+    healthcheck:
+      test: ['CMD-SHELL', 'mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ['redis-server', '--appendonly', 'yes']
+    volumes:
+      - qrcodly_redis:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Última release de comunidad que MinIO publicó como contenedor
+  # (RELEASE.2025-09-07T16-13-09Z; el Dockerfile.release incluye curl y mc).
+  # Comprobado el 2026-11-03: Docker Hub elimina minio/minio (404) y
+  # quay.io/minio/minio responde 401. Hay que cargar esta imagen en el
+  # daemon desde un espejo propio antes del primer arranque.
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    restart: unless-stopped
+    command: ['server', '/data', '--console-address', ':9001']
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Define MINIO_ROOT_USER en .env.production. Mínimo 3 caracteres; no uses minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Define MINIO_ROOT_PASSWORD en .env.production. Mínimo 8 caracteres; openssl rand -hex 32}
+    volumes:
+      - qrcodly_minio:/data
+    ports:
+      - '127.0.0.1:9000:9000'
+    # La imagen oficial trae curl. `mc ready local` pide un alias `local`
+    # que el entrypoint no crea, y no sale hasta que el cluster responde,
+    # así que el probe usa el endpoint de vida.
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://127.0.0.1:9000/minio/health/live']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # Último tag de github.com/minio/mc (RELEASE.2025-08-13T08-35-41Z).
+  # minio/mc tampoco está en Docker Hub (404 el 2026-11-03).
+  minio-setup:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    restart: 'no'
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Define MINIO_ROOT_USER en .env.production. Mínimo 3 caracteres; no uses minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Define MINIO_ROOT_PASSWORD en .env.production. Mínimo 8 caracteres; openssl rand -hex 32}
+    entrypoint: ['/bin/sh', '-c']
+    command:
+      - |
+        until /usr/bin/mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"; do
+          sleep 1
+        done
+        /usr/bin/mc mb --ignore-existing local/qrcodly
+        /usr/bin/mc anonymous set download local/qrcodly
+
+  migrate:
+    image: qrcodly-backend:prod
+    build:
+      context: .
+      dockerfile: apps/backend/Dockerfile
+    command: ['node', 'build/src/core/db/migrate.js']
+    restart: 'no'
+    env_file:
+      - .env.production
+    environment:
+      DB_MIGRATING: 'true'
+      DB_HOST: db
+      DB_PORT: '3306'
+      DB_NAME: qrcodly
+      DB_USER: ${DB_USER:-qrcodly}
+      DB_PASSWORD: ${DB_PASSWORD:?Define DB_PASSWORD en .env.production. Genera uno con openssl rand -hex 32}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  backend:
+    image: qrcodly-backend:prod
+    build:
+      context: .
+      dockerfile: apps/backend/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env.production
+    environment:
+      # NODE_ENV, API_HOST, API_PORT y TZ ya vienen en la imagen.
+      DB_HOST: db
+      DB_PORT: '3306'
+      DB_NAME: qrcodly
+      DB_USER: ${DB_USER:-qrcodly}
+      DB_PASSWORD: ${DB_PASSWORD:?Define DB_PASSWORD en .env.production. Genera uno con openssl rand -hex 32}
+      DB_MIGRATING: 'false'
+      REDIS_URL: redis://redis:6379
+      BASE_URL: https://qr.weareadn.dev
+      FRONTEND_URL: https://qr.weareadn.dev
+      BACKEND_URL: https://qr.weareadn.dev
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET_NAME: qrcodly
+      S3_PUBLIC_URL: https://qr.weareadn.dev/storage/qrcodly
+      S3_UPLOAD_KEY: ${MINIO_ROOT_USER:?Define MINIO_ROOT_USER en .env.production. Mínimo 3 caracteres; no uses minio}
+      S3_UPLOAD_SECRET: ${MINIO_ROOT_PASSWORD:?Define MINIO_ROOT_PASSWORD en .env.production. Mínimo 8 caracteres; openssl rand -hex 32}
+      COOKIE_SECRET: ${COOKIE_SECRET:?Define COOKIE_SECRET en .env.production. Mínimo 32 caracteres; openssl rand -hex 32}
+      JWT_SECRET: ${JWT_SECRET:?Define JWT_SECRET en .env.production. Mínimo 32 caracteres; openssl rand -hex 32}
+      INTERNAL_API_SECRET: ${INTERNAL_API_SECRET:?Define INTERNAL_API_SECRET en .env.production. Mínimo 32 caracteres; recomendado openssl rand -hex 32}
+      ANALYTICS_ENCRYPTION_KEY: ${ANALYTICS_ENCRYPTION_KEY:?Define ANALYTICS_ENCRYPTION_KEY en .env.production. Tiene que ser 64 hex; openssl rand -hex 32}
+      CRON_ENABLED: 'true'
+      URL_SAFETY_RECHECK_MODE: shadow
+      AUTHORIZED_PARTY_CHECK_MODE: shadow
+    ports:
+      - '127.0.0.1:5001:5001'
+    read_only: true
+    tmpfs:
+      # uid 1000 (usuario node de la imagen) tiene que poder escribir.
+      - /tmp:mode=1777,size=512m
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:5001/api/v1').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-setup:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+
+  frontend:
+    image: qrcodly-frontend:prod
+    build:
+      context: .
+      dockerfile: apps/frontend/Dockerfile
+      network: host
+      args:
+        NEXT_PUBLIC_FRONTEND_URL: ${NEXT_PUBLIC_FRONTEND_URL:-https://qr.weareadn.dev}
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-https://qr.weareadn.dev/api/v1}
+        NEXT_PUBLIC_SHORT_URL_DOMAIN: ${NEXT_PUBLIC_SHORT_URL_DOMAIN:-}
+        NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:?Define NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY en .env.production}
+        NEXT_PUBLIC_CLERK_JS_URL: ${NEXT_PUBLIC_CLERK_JS_URL:-/__clerk-js/dist/clerk.browser.min.js}
+        NEXT_PUBLIC_POSTHOG_KEY: ${NEXT_PUBLIC_POSTHOG_KEY:-}
+        NEXT_PUBLIC_POSTHOG_HOST: ${NEXT_PUBLIC_POSTHOG_HOST:-}
+        NEXT_PUBLIC_SENTRY_DSN: ${NEXT_PUBLIC_SENTRY_DSN:?Define NEXT_PUBLIC_SENTRY_DSN en .env.production}
+        NEXT_PUBLIC_SENTRY_ENVIRONMENT: production
+        NEXT_PUBLIC_STRIPE_PRO_PRICE_ID_MONTHLY: ${NEXT_PUBLIC_STRIPE_PRO_PRICE_ID_MONTHLY:?Define NEXT_PUBLIC_STRIPE_PRO_PRICE_ID_MONTHLY en .env.production}
+        NEXT_PUBLIC_STRIPE_PRO_PRICE_ID_ANNUAL: ${NEXT_PUBLIC_STRIPE_PRO_PRICE_ID_ANNUAL:?Define NEXT_PUBLIC_STRIPE_PRO_PRICE_ID_ANNUAL en .env.production}
+        NEXT_PUBLIC_STRIPE_PRO_PRICE_ID_MONTHLY_LEGACY: ${NEXT_PUBLIC_STRIPE_PRO_PRICE_ID_MONTHLY_LEGACY:-}
+        NEXT_PUBLIC_STRIPE_PRO_PRICE_ID_ANNUAL_LEGACY: ${NEXT_PUBLIC_STRIPE_PRO_PRICE_ID_ANNUAL_LEGACY:-}
+        NEXT_PUBLIC_STRIPE_ADDON_DOMAIN_PRICE_ID_MONTHLY: ${NEXT_PUBLIC_STRIPE_ADDON_DOMAIN_PRICE_ID_MONTHLY:?Define NEXT_PUBLIC_STRIPE_ADDON_DOMAIN_PRICE_ID_MONTHLY en .env.production}
+        NEXT_PUBLIC_STRIPE_ADDON_DOMAIN_PRICE_ID_ANNUAL: ${NEXT_PUBLIC_STRIPE_ADDON_DOMAIN_PRICE_ID_ANNUAL:?Define NEXT_PUBLIC_STRIPE_ADDON_DOMAIN_PRICE_ID_ANNUAL en .env.production}
+        NEXT_PUBLIC_GOOGLE_API_KEY: ${NEXT_PUBLIC_GOOGLE_API_KEY:?Define NEXT_PUBLIC_GOOGLE_API_KEY en .env.production}
+        OPENAPI_URL: ${OPENAPI_URL:-http://127.0.0.1:5001/api/v1/openapi.json}
+    restart: unless-stopped
+    env_file:
+      - .env.production
+    environment:
+      API_INTERNAL_URL: http://backend:5001/api/v1
+      INTERNAL_API_SECRET: ${INTERNAL_API_SECRET:?Define INTERNAL_API_SECRET en .env.production. Mínimo 32 caracteres; recomendado openssl rand -hex 32}
+    ports:
+      - '127.0.0.1:3000:3000'
+    read_only: true
+    tmpfs:
+      - /app/apps/frontend/.next/cache:uid=1000,gid=1000,mode=0755,size=512m
+      - /app/apps/frontend/.next/server/route-cache:uid=1000,gid=1000,mode=0755,size=128m
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  qrcodly_db:
+    name: qrcodly_db
+  qrcodly_redis:
+    name: qrcodly_redis
+  qrcodly_minio:
+    name: qrcodly_minio

@@ -96,6 +96,16 @@ const config = {
 				hostname: 'cdn-stage.qrcodly.de',
 				pathname: '/**',
 			},
+			// Objetos públicos de MinIO, servidos por el mismo dominio bajo /storage/.
+			...(process.env.NEXT_PUBLIC_FRONTEND_URL
+				? [
+						{
+							protocol: 'https',
+							hostname: new URL(process.env.NEXT_PUBLIC_FRONTEND_URL).hostname,
+							pathname: '/storage/**',
+						},
+					]
+				: []),
 		],
 		formats: ['image/avif', 'image/webp'],
 	},
