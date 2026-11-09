@@ -1,12 +1,8 @@
 # Override SOLO para pruebas en localhost. Uso:
 #   docker compose -f docker-compose.prod.yaml -f docker-compose.local.yaml up -d ...
-# Lee las variables de .env (no de .env.production) y sustituye MinIO por pgsty/silo,
-# porque minio/minio y minio/mc ya no se descargan de Docker Hub.
+# Lee las variables de .env (no de .env.production) y reescribe las URLs de localhost.
+# MinIO ya apunta a pgsty/silo y pgsty/mc en docker-compose.prod.yaml.
 services:
-  minio:
-    image: pgsty/silo:RELEASE.2026-10-18T00-00-00Z
-  minio-setup:
-    image: pgsty/silo:RELEASE.2026-10-18T00-00-00Z
   migrate:
     env_file: !override
       - .env
