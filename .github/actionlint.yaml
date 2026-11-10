@@ -1,0 +1,5 @@
+# actionlint:latest ya no trae el label hospedado macos-13.
+# desktop-build.yml sigue pidiéndolo para el binario macOS x64.
+self-hosted-runner:
+  labels:
+    - macos-13

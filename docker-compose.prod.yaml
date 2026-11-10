@@ -3,19 +3,22 @@
 # y rellena los secretos. .gitignore ignora .env.production a propósito;
 # la plantilla .env.production.example sí se versiona.
 #
-# Despliegue en dos pasos. `next build` descarga el OpenAPI del API, así que
-# no construyas frontend y backend en el mismo `up`:
-#   1. docker compose -f docker-compose.prod.yaml up -d --build backend
-#      Arranca db, redis, minio, minio-setup y migrate, y deja el API
-#      en 127.0.0.1:5001.
-#   2. docker compose -f docker-compose.prod.yaml up -d --build frontend
-#      El build usa la red del host y
-#      OPENAPI_URL=http://127.0.0.1:5001/api/v1/openapi.json.
+# migrate y backend usan ghcr.io/ario-weareadn/qrcodly-backend.
+# frontend usa ghcr.io/ario-weareadn/qrcodly-frontend. Las dos son
+# linux/amd64. El tag es QRCODLY_TAG; vacío o ausente equivale a latest.
+# El servidor no compila estas imágenes: las descarga y arranca la pila.
 #
-# El botón de la extensión Docker de Plesk ejecuta `up --detach --wait`
-# sin `--build`. migrate, backend y frontend llevan `pull_policy: never`
-# para que ese botón no busque qrcodly-*:prod en Docker Hub. El primer
-# arranque sigue siendo por SSH, en las dos fases de arriba.
+#   docker compose -f docker-compose.prod.yaml pull \
+#     && docker compose -f docker-compose.prod.yaml up -d --wait
+#
+# En el servidor, `export COMPOSE_FILE=docker-compose.prod.yaml`
+# (o COMPOSE_FILE dentro de .env.production, cargado con
+# --env-file .env.production) evita repetir -f. Las ${...} de este
+# fichero salen de ese --env-file, no del env_file de cada servicio.
+#
+# Las NEXT_PUBLIC_* van horneadas en la imagen. Cambiarlas obliga a
+# relanzar el workflow de GitHub (variable FRONTEND_BUILD_ARGS), no a
+# editar este fichero.
 #
 # Plesk hace de proxy: / → frontend, /api/v1/ → backend,
 # /storage/qrcodly/ → API de MinIO. MySQL, Redis y la consola :9001 no se publican.
@@ -31,12 +34,16 @@ services:
       MYSQL_DATABASE: qrcodly
       MYSQL_USER: ${DB_USER:-qrcodly}
       MYSQL_PASSWORD: ${DB_PASSWORD:?Define DB_PASSWORD en .env.production. Genera uno con openssl rand -hex 32}
+    # El pool del API es 50. 128M de buffer cubren el datadir actual
+    # (cientos de MB) sin reservar 512M al arrancar. performance_schema
+    # queda fuera: en MySQL 8 se lleva otro bloque fijo.
     command:
-      - --max-connections=200
-      - --innodb-buffer-pool-size=512M
-      - --innodb-redo-log-capacity=256M
+      - --max-connections=100
+      - --innodb-buffer-pool-size=128M
+      - --innodb-redo-log-capacity=64M
       - --innodb-flush-log-at-trx-commit=2
       - --innodb-flush-method=O_DIRECT
+      - --performance-schema=OFF
     volumes:
       - qrcodly_db:/var/lib/mysql
     healthcheck:
@@ -102,11 +109,7 @@ services:
         /usr/bin/mc anonymous set download local/qrcodly
 
   migrate:
-    image: qrcodly-backend:prod
-    pull_policy: never
-    build:
-      context: .
-      dockerfile: apps/backend/Dockerfile
+    image: ghcr.io/ario-weareadn/qrcodly-backend:${QRCODLY_TAG:-latest}
     command: ['node', 'build/src/core/db/migrate.js']
     restart: 'no'
     env_file:
@@ -123,11 +126,7 @@ services:
         condition: service_healthy
 
   backend:
-    image: qrcodly-backend:prod
-    pull_policy: never
-    build:
-      context: .
-      dockerfile: apps/backend/Dockerfile
+    image: ghcr.io/ario-weareadn/qrcodly-backend:${QRCODLY_TAG:-latest}
     restart: unless-stopped
     env_file:
       - .env.production
@@ -182,30 +181,7 @@ services:
         condition: service_completed_successfully
 
   frontend:
-    image: qrcodly-frontend:prod
-    pull_policy: never
-    build:
-      context: .
-      dockerfile: apps/frontend/Dockerfile
-      network: host
-      args:
-        NEXT_PUBLIC_FRONTEND_URL: ${NEXT_PUBLIC_FRONTEND_URL:-https://qr.weareadn.dev}
-        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-https://qr.weareadn.dev/api/v1}
-        NEXT_PUBLIC_SHORT_URL_DOMAIN: ${NEXT_PUBLIC_SHORT_URL_DOMAIN:-}
-        NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:?Define NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY en .env.production}
-        NEXT_PUBLIC_CLERK_JS_URL: ${NEXT_PUBLIC_CLERK_JS_URL:-/__clerk-js/dist/clerk.browser.min.js}
-        NEXT_PUBLIC_POSTHOG_KEY: ${NEXT_PUBLIC_POSTHOG_KEY:-}
-        NEXT_PUBLIC_POSTHOG_HOST: ${NEXT_PUBLIC_POSTHOG_HOST:-}
-        NEXT_PUBLIC_SENTRY_DSN: ${NEXT_PUBLIC_SENTRY_DSN:?Define NEXT_PUBLIC_SENTRY_DSN en .env.production}
-        NEXT_PUBLIC_SENTRY_ENVIRONMENT: production
-        NEXT_PUBLIC_STRIPE_PRO_PRICE_ID_MONTHLY: ${NEXT_PUBLIC_STRIPE_PRO_PRICE_ID_MONTHLY:?Define NEXT_PUBLIC_STRIPE_PRO_PRICE_ID_MONTHLY en .env.production}
-        NEXT_PUBLIC_STRIPE_PRO_PRICE_ID_ANNUAL: ${NEXT_PUBLIC_STRIPE_PRO_PRICE_ID_ANNUAL:?Define NEXT_PUBLIC_STRIPE_PRO_PRICE_ID_ANNUAL en .env.production}
-        NEXT_PUBLIC_STRIPE_PRO_PRICE_ID_MONTHLY_LEGACY: ${NEXT_PUBLIC_STRIPE_PRO_PRICE_ID_MONTHLY_LEGACY:-}
-        NEXT_PUBLIC_STRIPE_PRO_PRICE_ID_ANNUAL_LEGACY: ${NEXT_PUBLIC_STRIPE_PRO_PRICE_ID_ANNUAL_LEGACY:-}
-        NEXT_PUBLIC_STRIPE_ADDON_DOMAIN_PRICE_ID_MONTHLY: ${NEXT_PUBLIC_STRIPE_ADDON_DOMAIN_PRICE_ID_MONTHLY:?Define NEXT_PUBLIC_STRIPE_ADDON_DOMAIN_PRICE_ID_MONTHLY en .env.production}
-        NEXT_PUBLIC_STRIPE_ADDON_DOMAIN_PRICE_ID_ANNUAL: ${NEXT_PUBLIC_STRIPE_ADDON_DOMAIN_PRICE_ID_ANNUAL:?Define NEXT_PUBLIC_STRIPE_ADDON_DOMAIN_PRICE_ID_ANNUAL en .env.production}
-        NEXT_PUBLIC_GOOGLE_API_KEY: ${NEXT_PUBLIC_GOOGLE_API_KEY:?Define NEXT_PUBLIC_GOOGLE_API_KEY en .env.production}
-        OPENAPI_URL: ${OPENAPI_URL:-http://127.0.0.1:5001/api/v1/openapi.json}
+    image: ghcr.io/ario-weareadn/qrcodly-frontend:${QRCODLY_TAG:-latest}
     restart: unless-stopped
     env_file:
       - .env.production

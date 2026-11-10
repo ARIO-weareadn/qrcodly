@@ -1,0 +1,154 @@
+# Stack efímero para simular el build de CI en local.
+# Secretos falsos en scripts/docker/ci.env. No reutiliza los volúmenes de
+# producción. backend y migrate esperan la imagen qrcodly-backend:ci,
+# que construye scripts/docker/simulate-ci.sh (pull_policy: never).
+
+name: qrcodly-ci
+
+services:
+  db:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ci-mysql-root-not-secret
+      MYSQL_DATABASE: qrcodly
+      MYSQL_USER: qrcodly
+      MYSQL_PASSWORD: ci-mysql-app-not-secret
+    # El pool del API es 50. 128M de buffer cubren el datadir actual
+    # (cientos de MB) sin reservar 512M al arrancar. performance_schema
+    # queda fuera: en MySQL 8 se lleva otro bloque fijo.
+    command:
+      - --max-connections=100
+      - --innodb-buffer-pool-size=128M
+      - --innodb-redo-log-capacity=64M
+      - --innodb-flush-log-at-trx-commit=2
+      - --innodb-flush-method=O_DIRECT
+      - --performance-schema=OFF
+    volumes:
+      - db:/var/lib/mysql
+    healthcheck:
+      test: ['CMD-SHELL', 'mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+  redis:
+    image: redis:7-alpine
+    command: ['redis-server', '--appendonly', 'yes']
+    volumes:
+      - redis:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # minio/minio ya no está en Docker Hub (404) ni en quay.io (401).
+  # pgsty/silo es el fork que sí se descarga. Trae curl y /usr/bin/mc.
+  # Comprobado el 2026-11-09: curl responde en /minio/health/live.
+  minio:
+    image: pgsty/silo:RELEASE.2026-10-18T00-00-00Z
+    command: ['server', '/data', '--console-address', ':9001']
+    environment:
+      MINIO_ROOT_USER: ciadmin
+      MINIO_ROOT_PASSWORD: ci-minio-not-secret
+    volumes:
+      - minio:/data
+    # La imagen trae curl. `mc ready local` pide un alias `local`
+    # que el entrypoint no crea, y no sale hasta que el cluster responde,
+    # así que el probe usa el endpoint de vida.
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://127.0.0.1:9000/minio/health/live']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # minio/mc tampoco está en Docker Hub. pgsty/mc trae /usr/bin/mc y /bin/sh.
+  minio-setup:
+    image: pgsty/mc:RELEASE.2026-10-18T00-00-00Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ciadmin
+      MINIO_ROOT_PASSWORD: ci-minio-not-secret
+    entrypoint: ['/bin/sh', '-c']
+    command:
+      - |
+        until /usr/bin/mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"; do
+          sleep 1
+        done
+        /usr/bin/mc mb --ignore-existing local/qrcodly
+        /usr/bin/mc anonymous set download local/qrcodly
+
+  migrate:
+    image: qrcodly-backend:ci
+    pull_policy: never
+    command: ['node', 'build/src/core/db/migrate.js']
+    env_file:
+      - scripts/docker/ci.env
+    environment:
+      DB_MIGRATING: 'true'
+      DB_HOST: db
+      DB_PORT: '3306'
+      DB_NAME: qrcodly
+      DB_USER: qrcodly
+      DB_PASSWORD: ci-mysql-app-not-secret
+    depends_on:
+      db:
+        condition: service_healthy
+
+  backend:
+    image: qrcodly-backend:ci
+    pull_policy: never
+    env_file:
+      - scripts/docker/ci.env
+    environment:
+      # NODE_ENV, API_HOST, API_PORT y TZ ya vienen en la imagen.
+      DB_HOST: db
+      DB_PORT: '3306'
+      DB_NAME: qrcodly
+      DB_USER: qrcodly
+      DB_PASSWORD: ci-mysql-app-not-secret
+      DB_MIGRATING: 'false'
+      REDIS_URL: redis://redis:6379
+      BASE_URL: http://127.0.0.1:5001
+      FRONTEND_URL: http://127.0.0.1:3000
+      BACKEND_URL: http://127.0.0.1:5001
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET_NAME: qrcodly
+      S3_PUBLIC_URL: http://127.0.0.1:9000/qrcodly
+      S3_UPLOAD_KEY: ciadmin
+      S3_UPLOAD_SECRET: ci-minio-not-secret
+      CRON_ENABLED: 'false'
+    ports:
+      - '127.0.0.1:5001:5001'
+    read_only: true
+    tmpfs:
+      # uid 1000 (usuario node de la imagen) tiene que poder escribir.
+      - /tmp:mode=1777,size=512m
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:5001/api/v1').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-setup:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  db:
+  redis:
+  minio:

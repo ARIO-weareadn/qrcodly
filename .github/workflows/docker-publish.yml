@@ -1,0 +1,266 @@
+# Publishes qrcodly-backend and qrcodly-frontend to GHCR. Does not publish mcp-server.
+#   push to main      -> :latest and :<sha7>
+#   push of tag v*    -> :<git tag> and :latest
+#   workflow_dispatch -> :<sha7> only, from any branch including main
+#
+# FRONTEND_BUILD_ARGS (Actions variable): one KEY=value per line, same nine
+# keys container.yml checks. Login uses GITHUB_TOKEN.
+#
+# The backend build is pushed and loaded, then tagged qrcodly-backend:ci for
+# docker-compose.ci.yaml (pull_policy: never). The frontend build uses the
+# host network so it can read http://127.0.0.1:5001/api/v1/openapi.json.
+#
+# Third-party actions are pinned to a commit.
+name: Publish Docker images
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'load-tests/**'
+      - 'apps/desktop/**'
+      - 'apps/browser-extension/**'
+      - 'apps/integrations/**'
+  workflow_dispatch:
+
+# One run per ref. An older publish must not be cancelled mid-push.
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+# No token rights by default; the job asks for what it needs
+permissions: {}
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Required build args are set
+        env:
+          BUILD_ARGS: ${{ vars.FRONTEND_BUILD_ARGS }}
+        run: |
+          missing=0
+          for key in NEXT_PUBLIC_FRONTEND_URL NEXT_PUBLIC_API_URL NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY \
+                     NEXT_PUBLIC_SENTRY_DSN NEXT_PUBLIC_GOOGLE_API_KEY \
+                     NEXT_PUBLIC_STRIPE_PRO_PRICE_ID_MONTHLY NEXT_PUBLIC_STRIPE_PRO_PRICE_ID_ANNUAL \
+                     NEXT_PUBLIC_STRIPE_ADDON_DOMAIN_PRICE_ID_MONTHLY NEXT_PUBLIC_STRIPE_ADDON_DOMAIN_PRICE_ID_ANNUAL; do
+            if ! printf '%s\n' "$BUILD_ARGS" | grep -q "^${key}=."; then
+              echo "::error::${key} is missing in the build args variable"; missing=1
+            fi
+          done
+          exit $missing
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # docker-container driver: "host" is the BuildKit container unless that
+      # container itself shares the runner network. The frontend build has to
+      # reach the API published on 127.0.0.1:5001.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        with:
+          driver-opts: network=host
+          buildkitd-flags: --allow-insecure-entitlement network.host
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # metadata-action v6.2.0: format=short is 7 hex chars (do not set
+      # DOCKER_METADATA_SHORT_SHA_LENGTH). prefix= drops the default "sha-".
+      # latest=false: :latest comes only from the raw tag on push events.
+      - name: Backend image metadata
+        id: meta-backend
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/qrcodly-backend
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=latest,enable=${{ github.event_name == 'push' }}
+            type=sha,format=short,prefix=,enable=${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref_type == 'branch') }}
+            type=raw,value=${{ github.ref_name }},enable=${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Frontend image metadata
+        id: meta-frontend
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/qrcodly-frontend
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=latest,enable=${{ github.event_name == 'push' }}
+            type=sha,format=short,prefix=,enable=${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref_type == 'branch') }}
+            type=raw,value=${{ github.ref_name }},enable=${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Build and push backend
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: apps/backend/Dockerfile
+          platforms: linux/amd64
+          push: true
+          load: true
+          tags: ${{ steps.meta-backend.outputs.tags }}
+          labels: ${{ steps.meta-backend.outputs.labels }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,scope=backend,mode=max
+
+      - name: Tag backend image for compose
+        env:
+          TAGS: ${{ steps.meta-backend.outputs.tags }}
+        run: |
+          tagged=0
+          tags_file="$(mktemp)"
+          printf '%s\n' "$TAGS" >"$tags_file"
+          while IFS= read -r tag || [ -n "$tag" ]; do
+            if [ -z "$tag" ]; then
+              continue
+            fi
+            if docker image inspect "$tag" >/dev/null 2>&1; then
+              docker tag "$tag" qrcodly-backend:ci
+              tagged=1
+              break
+            fi
+          done <"$tags_file"
+          rm -f "$tags_file"
+          if [ "$tagged" -ne 1 ]; then
+            docker image ls --format '{{.Repository}}:{{.Tag}}' >&2 || true
+            echo "::error::backend image was not loaded into the local daemon"
+            exit 1
+          fi
+
+      - name: Start CI stack
+        run: |
+          if docker compose -f docker-compose.ci.yaml up -d --wait; then
+            exit 0
+          fi
+          {
+            echo "### Backend container log"
+            echo '```text'
+            docker compose -f docker-compose.ci.yaml logs --no-color backend 2>&1 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Build and push frontend
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: apps/frontend/Dockerfile
+          platforms: linux/amd64
+          push: true
+          network: host
+          allow: network.host
+          tags: ${{ steps.meta-frontend.outputs.tags }}
+          labels: ${{ steps.meta-frontend.outputs.labels }}
+          build-args: |
+            ${{ vars.FRONTEND_BUILD_ARGS }}
+            OPENAPI_URL=http://127.0.0.1:5001/api/v1/openapi.json
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,scope=frontend,mode=max
+
+      - name: Smoke test published images
+        env:
+          BACKEND_TAGS: ${{ steps.meta-backend.outputs.tags }}
+          FRONTEND_TAGS: ${{ steps.meta-frontend.outputs.tags }}
+          BUILD_ARGS: ${{ vars.FRONTEND_BUILD_ARGS }}
+        run: |
+          pull_tag() {
+            image="$1"
+            attempt=1
+            while [ "$attempt" -le 6 ]; do
+              if docker pull "$image"; then
+                return 0
+              fi
+              attempt=$((attempt + 1))
+              sleep 5
+            done
+            echo "::error::could not pull ${image}"
+            return 1
+          }
+
+          pull_tags() {
+            label="$1"
+            value="$2"
+            count=0
+            tags_file="$(mktemp)"
+            printf '%s\n' "$value" >"$tags_file"
+            while IFS= read -r tag || [ -n "$tag" ]; do
+              if [ -z "$tag" ]; then
+                continue
+              fi
+              pull_tag "$tag" || exit 1
+              count=$((count + 1))
+            done <"$tags_file"
+            rm -f "$tags_file"
+            if [ "$count" -eq 0 ]; then
+              echo "::error::metadata-action did not produce a ${label} tag"
+              exit 1
+            fi
+          }
+
+          pull_tags backend "$BACKEND_TAGS"
+          pull_tags frontend "$FRONTEND_TAGS"
+
+          backend_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "http://127.0.0.1:5001/api/v1" || true)"
+          if [ "$backend_code" != "200" ]; then
+            echo "::error::backend GET /api/v1 returned ${backend_code:-no response}"
+            exit 1
+          fi
+
+          frontend_image="$(printf '%s\n' "$FRONTEND_TAGS" | awk 'NF { print; exit }')"
+          envfile="$(mktemp)"
+          trap 'rm -f "$envfile"' EXIT
+          chmod 600 "$envfile"
+          printf '%s\n' "$BUILD_ARGS" >"$envfile"
+          printf '%s\n' \
+            'AXIOM_TOKEN=ci-fake-axiom-token' \
+            'AXIOM_DATASET=ci-fake' \
+            'CLERK_SECRET_KEY=sk_test_ciFakeNotARealClerkSecretKey000' \
+            'INTERNAL_API_SECRET=ci-internal-api-secret-not-real-32b' >>"$envfile"
+
+          docker rm -f qrcodly-ci-frontend-smoke >/dev/null 2>&1 || true
+          if ! docker run -d --name qrcodly-ci-frontend-smoke \
+            --read-only \
+            --tmpfs /app/apps/frontend/.next/cache:uid=1000,gid=1000,mode=0755,size=512m \
+            --tmpfs /app/apps/frontend/.next/server/route-cache:uid=1000,gid=1000,mode=0755,size=128m \
+            --env-file "$envfile" \
+            -p "127.0.0.1:33173:3000" \
+            "$frontend_image" >/dev/null; then
+            echo "::error::frontend smoke container did not start"
+            exit 1
+          fi
+
+          frontend_code=""
+          for _ in $(seq 1 45); do
+            frontend_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:33173/" || true)"
+            if [ "$frontend_code" = "200" ]; then
+              break
+            fi
+            sleep 2
+          done
+          if [ "$frontend_code" != "200" ]; then
+            docker logs --tail 40 qrcodly-ci-frontend-smoke >&2 || true
+            echo "::error::frontend GET / returned ${frontend_code:-no response}"
+            exit 1
+          fi
+
+      - name: Tear down CI stack
+        if: always()
+        run: |
+          docker rm -f qrcodly-ci-frontend-smoke >/dev/null 2>&1 || true
+          if [ -f docker-compose.ci.yaml ]; then
+            docker compose -f docker-compose.ci.yaml down -v
+          fi

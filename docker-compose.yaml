@@ -1,3 +1,7 @@
+# Arranque mínimo del API en local: MySQL, Redis y MinIO.
+# phpMyAdmin: docker compose --profile tools up -d
+# Umami:      docker compose --profile analytics up -d
+
 services:
   db:
     container_name: qrcodly-db
@@ -6,18 +10,22 @@ services:
     environment:
       MYSQL_ROOT_PASSWORD: root
       MYSQL_DATABASE: qrcodly
+    # El pool de la app es 50 conexiones. El buffer de 512M se reservaba
+    # entero al arrancar para un datadir de unos cientos de MB.
     command:
-      - --max-connections=200
-      - --innodb-buffer-pool-size=512M
-      - --innodb-redo-log-capacity=256M
+      - --max-connections=100
+      - --innodb-buffer-pool-size=128M
+      - --innodb-redo-log-capacity=64M
       - --innodb-flush-log-at-trx-commit=2
       - --innodb-flush-method=O_DIRECT
+      - --performance-schema=OFF
     volumes:
       - database:/var/lib/mysql
     ports:
       - 3306:3306
 
   phpmyadmin:
+    profiles: ['tools']
     container_name: qrcodly-pma
     image: phpmyadmin
     restart: always
@@ -35,6 +43,7 @@ services:
     ports:
       - 6379:6379
   umami:
+    profiles: ['analytics']
     container_name: umami
     image: ghcr.io/umami-software/umami:latest
     ports:
@@ -54,6 +63,7 @@ services:
       timeout: 5s
       retries: 5
   umami_db:
+    profiles: ['analytics']
     container_name: umami-db
     image: postgres:15-alpine
     environment:
