@@ -403,8 +403,14 @@ check_http() {
 	fi
 }
 
-check_http "http://127.0.0.1:5001/api/v1"
-check_http "http://127.0.0.1:3000/"
+env_port() {
+	local value
+	value="$(sed -n "s/^[[:space:]]*$1=//p" "$ENV_FILE" | tail -n 1 | tr -d '"'"'"'[:space:]')"
+	printf '%s' "${value:-$2}"
+}
+
+check_http "http://127.0.0.1:$(env_port BACKEND_HOST_PORT 5001)/api/v1"
+check_http "http://127.0.0.1:$(env_port FRONTEND_HOST_PORT 3000)/"
 
 check_history() {
 	local image="$1"

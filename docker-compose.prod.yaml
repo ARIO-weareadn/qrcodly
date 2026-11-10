@@ -22,6 +22,11 @@
 #
 # Plesk hace de proxy: / → frontend, /api/v1/ → backend,
 # /storage/qrcodly/ → API de MinIO. MySQL, Redis y la consola :9001 no se publican.
+#
+# Puertos del host (siempre en 127.0.0.1), configurables en .env.production:
+#   BACKEND_HOST_PORT (5001), FRONTEND_HOST_PORT (3000), MINIO_HOST_PORT (9000).
+# Solo cambian el puerto publicado; dentro de la red el contenedor sigue en el
+# suyo. Si cambias alguno, apunta el proxy de Plesk al nuevo puerto.
 
 name: qrcodly-prod
 
@@ -78,7 +83,7 @@ services:
     volumes:
       - qrcodly_minio:/data
     ports:
-      - '127.0.0.1:9000:9000'
+      - '127.0.0.1:${MINIO_HOST_PORT:-9000}:9000'
     # La imagen trae curl. `mc ready local` pide un alias `local`
     # que el entrypoint no crea, y no sale hasta que el cluster responde,
     # así que el probe usa el endpoint de vida.
@@ -155,7 +160,7 @@ services:
       URL_SAFETY_RECHECK_MODE: shadow
       AUTHORIZED_PARTY_CHECK_MODE: shadow
     ports:
-      - '127.0.0.1:5001:5001'
+      - '127.0.0.1:${BACKEND_HOST_PORT:-5001}:5001'
     read_only: true
     tmpfs:
       # uid 1000 (usuario node de la imagen) tiene que poder escribir.
@@ -189,7 +194,7 @@ services:
       API_INTERNAL_URL: http://backend:5001/api/v1
       INTERNAL_API_SECRET: ${INTERNAL_API_SECRET:?Define INTERNAL_API_SECRET en .env.production. Mínimo 32 caracteres; recomendado openssl rand -hex 32}
     ports:
-      - '127.0.0.1:3000:3000'
+      - '127.0.0.1:${FRONTEND_HOST_PORT:-3000}:3000'
     read_only: true
     tmpfs:
       - /app/apps/frontend/.next/cache:uid=1000,gid=1000,mode=0755,size=512m
