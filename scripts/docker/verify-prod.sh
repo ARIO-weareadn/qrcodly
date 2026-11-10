@@ -1,6 +1,25 @@
 #!/usr/bin/env bash
 # Valida imágenes ya publicadas en GHCR contra docker-compose.prod.yaml.
 # No compila. El trap no baja la pila salvo --down.
+#
+# Levantar (desde la raíz del repo; --tag por defecto: latest):
+#   bash scripts/docker/verify-prod.sh --tag v1.0.0
+#   bash scripts/docker/verify-prod.sh --tag a1b2c3d --env-file /ruta/.env.production
+#   El tag puede ser un tag git (v1.0.0), un sha de 7 caracteres o latest.
+#
+# Parar:
+#   - Al terminar el script, sin dejar nada corriendo:
+#       bash scripts/docker/verify-prod.sh --tag v1.0.0 --down
+#   - Después, si se lanzó sin --down (mismo tag y mismo env file):
+#       QRCODLY_TAG=v1.0.0 docker compose --env-file .env.production \
+#         -f docker-compose.prod.yaml down
+#   - Sin tag ni env file a mano (el proyecto se llama qrcodly-prod):
+#       docker compose -p qrcodly-prod down
+#
+# Eliminar los datos (base de datos y MinIO; no se puede deshacer):
+#   QRCODLY_TAG=v1.0.0 docker compose --env-file .env.production \
+#     -f docker-compose.prod.yaml down -v
+#   `down` a secas conserva los volúmenes.
 
 set -euo pipefail
 
